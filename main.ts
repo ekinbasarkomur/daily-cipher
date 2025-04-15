@@ -1,11 +1,11 @@
-import { App, Editor, MarkdownView, Modal, Notice, Plugin, PluginSettingTab, Setting, TFile, TFolder } from 'obsidian';
+import { App, Editor, MarkdownView, Modal, Notice, Plugin, PluginSettingTab, Setting, TFile, TFolder, TAbstractFile } from 'obsidian';
 
 interface DailyCipherSettings {
-    mySetting: string;
+    encryptionKey: string;
 }
 
 const DEFAULT_SETTINGS: DailyCipherSettings = {
-    mySetting: 'default'
+    encryptionKey: ''
 }
 
 export default class DailyCipher extends Plugin {
@@ -81,54 +81,12 @@ export default class DailyCipher extends Plugin {
     async saveSettings() {
         await this.saveData(this.settings);
     }
-
-    // Add Daily/ to .gitignore
-    async addToGitignore() {
-        const gitignorePath = '.gitignore';
-        const dailyEntry = 'Daily/';
-        let content = '';
-
-        // Check if .gitignore exists
-        const gitignoreFile = this.app.vault.getAbstractFileByPath(gitignorePath);
-        if (gitignoreFile instanceof TFile) {
-            content = await this.app.vault.read(gitignoreFile);
-        }
-
-        // Add Daily/ if not already present
-        if (!content.split('\n').includes(dailyEntry)) {
-            content = content ? `${content.trim()}\n${dailyEntry}\n` : `${dailyEntry}\n`;
-            if (gitignoreFile instanceof TFile) {
-                await this.app.vault.modify(gitignoreFile, content);
-            } else {
-                await this.app.vault.create(gitignorePath, content);
-            }
-            new Notice('Added Daily/ to .gitignore');
-        }
-    }
-
-    // Remove Daily/ from .gitignore
-    async removeFromGitignore() {
-        const gitignorePath = '.gitignore';
-        const dailyEntry = 'Daily/';
-        const gitignoreFile = this.app.vault.getAbstractFileByPath(gitignorePath);
-
-        if (gitignoreFile instanceof TFile) {
-            let content = await this.app.vault.read(gitignoreFile);
-            const lines = content.split('\n');
-            const updatedLines = lines.filter(line => line.trim() !== dailyEntry);
-            const updatedContent = updatedLines.join('\n').trim() + '\n';
-
-            if (updatedLines.length < lines.length) {
-                await this.app.vault.modify(gitignoreFile, updatedContent);
-                new Notice('Removed Daily/ from .gitignore');
-            }
-        }
-    }
 }
 
 // Modal for encryption/decryption
 class CryptoModal extends Modal {
     plugin: DailyCipher;
+    private password: string = '';
 
     constructor(app: App, plugin: DailyCipher) {
         super(app);
@@ -139,16 +97,19 @@ class CryptoModal extends Modal {
         const { contentEl } = this;
         contentEl.empty();
         contentEl.createEl('h2', { text: 'Daily Cipher: Encrypt/Decrypt Notes' });
+        
 
-        // Input for password (not stored in state)
-        let passwordInput: HTMLInputElement;
+        // Input for password (stored in this.plugin.settings.encryptionKey)
         new Setting(contentEl)
             .setName('Password')
             .setDesc('Enter a strong password for encryption/decryption')
-            .addText(text => {
-                passwordInput = text.inputEl;
-                text.setPlaceholder('Enter password').setValue('');
-            });
+            .addText(text => text
+                .setPlaceholder('Enter key')
+                .setValue(this.plugin.settings.encryptionKey)
+                .onChange(async (value) => {
+                    this.plugin.settings.encryptionKey = value;
+                    await this.plugin.saveSettings();
+                }));
 
         // Encrypt button
         new Setting(contentEl)
@@ -157,25 +118,18 @@ class CryptoModal extends Modal {
                 .setCta()
                 .onClick(async () => {
                     try {
-                        const password = passwordInput.value;
-                        await this.encryptFiles(password);
-                        //await this.plugin.removeFromGitignore();
+                        await this.encryptFiles(this.plugin.settings.encryptionKey);
                         new Notice('Encryption completed successfully!');
                     } catch (e) {
                         new Notice(`Encryption failed: ${e.message}`);
                     }
-                }));
-
-        // Decrypt button
-        new Setting(contentEl)
+                }))
             .addButton(button => button
                 .setButtonText('Decrypt Daily Notes')
                 .setCta()
                 .onClick(async () => {
                     try {
-                        const password = passwordInput.value;
-                        await this.decryptFiles(password);
-                        //await this.plugin.addToGitignore();
+                        await this.decryptFiles(this.plugin.settings.encryptionKey);
                         new Notice('Decryption completed successfully!');
                     } catch (e) {
                         new Notice(`Decryption failed: ${e.message}`);
@@ -183,22 +137,82 @@ class CryptoModal extends Modal {
                 }));
     }
 
+    // Recursively collect all files from a folder and its subdirectories
+    private collectFiles(folder: TFolder): TFile[] {
+        let files: TFile[] = [];
+        for (const child of folder.children) {
+            if (child instanceof TFile) {
+                files.push(child);
+            } else if (child instanceof TFolder) {
+                files = files.concat(this.collectFiles(child));
+            }
+        }
+        return files;
+    }
+
+    // Check if a file is an image or video based on extension
+    private isMedia(file: TFile): boolean {
+        const mediaExtensions = [
+            'png', 'jpg', 'jpeg', 'gif', 'bmp', 'svg', // Images
+            'mp4', 'mov', 'avi', 'mkv', 'webm' // Videos
+        ];
+        const extension = file.extension.toLowerCase();
+        return mediaExtensions.includes(extension);
+    }
+
+    private isEncrypted(content: string): boolean {
+        try {
+            const parsed = JSON.parse(content);
+            // Check if the parsed object has the expected structure for encrypted data
+            return parsed.iv && parsed.salt && parsed.ciphertext && 
+                   typeof parsed.iv === 'string' && 
+                   typeof parsed.salt === 'string' && 
+                   typeof parsed.ciphertext === 'string';
+        } catch (e) {
+            // If parsing fails, it's not an encrypted file
+            return false;
+        }
+    }
+
     async encryptFiles(password: string) {
         if (!password) {
             throw new Error('Please provide a password!');
         }
 
-        const dailyFolder = this.app.vault.getAbstractFileByPath('Daily');
+        const dailyFolder = this.app.vault.getAbstractFileByPath('Journal/Daily');
         if (!(dailyFolder instanceof TFolder)) {
             throw new Error('Daily folder not found!');
         }
 
-        const files = dailyFolder.children.filter(file => file instanceof TFile) as TFile[];
+        const files = this.collectFiles(dailyFolder);
+        if (files.length === 0) {
+            throw new Error('No files found in Daily folder or its subdirectories!');
+        }
+
+        let encryptedCount = 0;
         for (const file of files) {
-            const content = await this.app.vault.read(file);
-            const encryptedData = await this.encryptContent(content, password);
-            const encodedData = this.encodeEncryptedData(encryptedData);
-            await this.app.vault.modify(file, encodedData);
+            try {
+                if (this.isMedia(file)) {
+                    new Notice(`Skipped ${file.path}: media file`);
+                    continue;
+                }
+                const content = await this.app.vault.read(file);
+                if (this.isEncrypted(content)) {
+                    new Notice(`Skipped ${file.path}: already encrypted`);
+                    continue;
+                }
+                const encryptedData = await this.encryptContent(content, password);
+                const encodedData = this.encodeEncryptedData(encryptedData);
+                await this.app.vault.modify(file, encodedData);
+                encryptedCount++;
+            } catch (e) {
+                new Notice(`Failed to encrypt ${file.path}: ${e.message}`);
+                continue; // Skip to the next file on error
+            }
+        }
+
+        if (encryptedCount === 0) {
+            new Notice('No files were encrypted: all files were media or failed.');
         }
     }
 
@@ -207,17 +221,26 @@ class CryptoModal extends Modal {
             throw new Error('Please provide a password!');
         }
 
-        const dailyFolder = this.app.vault.getAbstractFileByPath('Daily');
+        const dailyFolder = this.app.vault.getAbstractFileByPath('Journal/Daily');
         if (!(dailyFolder instanceof TFolder)) {
             throw new Error('Daily folder not found!');
         }
 
-        const files = dailyFolder.children.filter(file => file instanceof TFile) as TFile[];
+        const files = this.collectFiles(dailyFolder);
+        if (files.length === 0) {
+            throw new Error('No files found in Daily folder or its subdirectories!');
+        }
+
         for (const file of files) {
-            const encodedData = await this.app.vault.read(file);
-            const encryptedData = this.decodeEncryptedData(encodedData);
-            const decryptedContent = await this.decryptContent(encryptedData, password);
-            await this.app.vault.modify(file, decryptedContent);
+            try {
+                const encodedData = await this.app.vault.read(file);
+                const encryptedData = this.decodeEncryptedData(encodedData);
+                const decryptedContent = await this.decryptContent(encryptedData, password);
+                await this.app.vault.modify(file, decryptedContent);
+            } catch (e) {
+                new Notice(`Failed to decrypt ${file.path}: ${e.message}`);
+                continue; // Skip to the next file on error
+            }
         }
     }
 
