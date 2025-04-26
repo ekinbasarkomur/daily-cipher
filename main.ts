@@ -1,10 +1,12 @@
 import { App, Editor, MarkdownView, Modal, Notice, Plugin, PluginSettingTab, Setting, TFile, TFolder, TAbstractFile } from 'obsidian';
 
 interface DailyCipherSettings {
+    storePassword: boolean;
     encryptionKey: string;
 }
 
 const DEFAULT_SETTINGS: DailyCipherSettings = {
+    storePassword: false,
     encryptionKey: ''
 }
 
@@ -59,7 +61,7 @@ export default class DailyCipher extends Plugin {
         });
 
         // Settings tab
-        this.addSettingTab(new SampleSettingTab(this.app, this));
+        this.addSettingTab(new DailyCipherSettingTab(this.app, this));
 
         // Global DOM event (unchanged)
         this.registerDomEvent(document, 'click', (evt: MouseEvent) => {
@@ -98,17 +100,19 @@ class CryptoModal extends Modal {
         contentEl.empty();
         contentEl.createEl('h2', { text: 'Daily Cipher: Encrypt/Decrypt Notes' });
         
-
-        // Input for password (stored in this.plugin.settings.encryptionKey)
+        // Password input field
         new Setting(contentEl)
             .setName('Password')
-            .setDesc('Enter a strong password for encryption/decryption')
+            .setDesc('Enter your encryption password')
             .addText(text => text
-                .setPlaceholder('Enter key')
-                .setValue(this.plugin.settings.encryptionKey)
+                .setPlaceholder('Enter password')
+                .setValue(this.plugin.settings.storePassword ? this.plugin.settings.encryptionKey : '')
                 .onChange(async (value) => {
-                    this.plugin.settings.encryptionKey = value;
-                    await this.plugin.saveSettings();
+                    this.password = value;
+                    if (this.plugin.settings.storePassword) {
+                        this.plugin.settings.encryptionKey = value;
+                        await this.plugin.saveSettings();
+                    }
                 }));
 
         // Encrypt button
@@ -118,7 +122,11 @@ class CryptoModal extends Modal {
                 .setCta()
                 .onClick(async () => {
                     try {
-                        await this.encryptFiles(this.plugin.settings.encryptionKey);
+                        if (!this.password) {
+                            new Notice('Please enter a password');
+                            return;
+                        }
+                        await this.encryptFiles(this.password);
                         new Notice('Encryption completed successfully!');
                     } catch (e) {
                         new Notice(`Encryption failed: ${e.message}`);
@@ -129,7 +137,11 @@ class CryptoModal extends Modal {
                 .setCta()
                 .onClick(async () => {
                     try {
-                        await this.decryptFiles(this.plugin.settings.encryptionKey);
+                        if (!this.password) {
+                            new Notice('Please enter a password');
+                            return;
+                        }
+                        await this.decryptFiles(this.password);
                         new Notice('Decryption completed successfully!');
                     } catch (e) {
                         new Notice(`Decryption failed: ${e.message}`);
@@ -174,6 +186,31 @@ class CryptoModal extends Modal {
         }
     }
 
+    // Add these new helper functions
+    private separateFrontMatter(content: string): { frontMatter: string | null, mainContent: string } {
+        const frontMatterRegex = /^---([\s\S]*?)---\n([\s\S]*)$/;
+        const match = content.match(frontMatterRegex);
+        
+        if (match) {
+            return {
+                frontMatter: `---${match[1]}---\n`,
+                mainContent: match[2]
+            };
+        }
+        
+        return {
+            frontMatter: null,
+            mainContent: content
+        };
+    }
+
+    private combineFrontMatterAndContent(frontMatter: string | null, content: string): string {
+        if (frontMatter) {
+            return `${frontMatter}${content}`;
+        }
+        return content;
+    }
+
     async encryptFiles(password: string) {
         if (!password) {
             throw new Error('Please provide a password!');
@@ -197,17 +234,28 @@ class CryptoModal extends Modal {
                     continue;
                 }
                 const content = await this.app.vault.read(file);
+                
+                // Skip if already encrypted
                 if (this.isEncrypted(content)) {
                     new Notice(`Skipped ${file.path}: already encrypted`);
                     continue;
                 }
-                const encryptedData = await this.encryptContent(content, password);
+
+                // Separate frontmatter and content
+                const { frontMatter, mainContent } = this.separateFrontMatter(content);
+                
+                // Only encrypt the main content
+                const encryptedData = await this.encryptContent(mainContent, password);
                 const encodedData = this.encodeEncryptedData(encryptedData);
-                await this.app.vault.modify(file, encodedData);
+                
+                // Combine frontmatter with encrypted content
+                const finalContent = this.combineFrontMatterAndContent(frontMatter, encodedData);
+                
+                await this.app.vault.modify(file, finalContent);
                 encryptedCount++;
             } catch (e) {
                 new Notice(`Failed to encrypt ${file.path}: ${e.message}`);
-                continue; // Skip to the next file on error
+                continue;
             }
         }
 
@@ -233,13 +281,22 @@ class CryptoModal extends Modal {
 
         for (const file of files) {
             try {
-                const encodedData = await this.app.vault.read(file);
-                const encryptedData = this.decodeEncryptedData(encodedData);
+                const content = await this.app.vault.read(file);
+                
+                // Separate frontmatter and content
+                const { frontMatter, mainContent } = this.separateFrontMatter(content);
+                
+                // Only decrypt the main content
+                const encryptedData = this.decodeEncryptedData(mainContent);
                 const decryptedContent = await this.decryptContent(encryptedData, password);
-                await this.app.vault.modify(file, decryptedContent);
+                
+                // Combine frontmatter with decrypted content
+                const finalContent = this.combineFrontMatterAndContent(frontMatter, decryptedContent);
+                
+                await this.app.vault.modify(file, finalContent);
             } catch (e) {
                 new Notice(`Failed to decrypt ${file.path}: ${e.message}`);
-                continue; // Skip to the next file on error
+                continue;
             }
         }
     }
@@ -324,7 +381,7 @@ class CryptoModal extends Modal {
     }
 }
 
-class SampleSettingTab extends PluginSettingTab {
+class DailyCipherSettingTab extends PluginSettingTab {
     plugin: DailyCipher;
 
     constructor(app: App, plugin: DailyCipher) {
@@ -336,15 +393,50 @@ class SampleSettingTab extends PluginSettingTab {
         const { containerEl } = this;
         containerEl.empty();
 
+        containerEl.createEl('h2', { text: 'Daily Cipher Settings' });
+
         new Setting(containerEl)
-            .setName('Setting #1')
-            .setDesc('It\'s a secret')
-            .addText(text => text
-                .setPlaceholder('Enter your secret')
-                .setValue(this.plugin.settings.mySetting)
+            .setName('Store Password')
+            .setDesc('WARNING: Storing passwords is not recommended for security. Only enable if you understand the risks.')
+            .addToggle(toggle => toggle
+                .setValue(this.plugin.settings.storePassword)
                 .onChange(async (value) => {
-                    this.plugin.settings.mySetting = value;
+                    this.plugin.settings.storePassword = value;
+                    if (!value) {
+                        // Clear stored password when disabling storage
+                        this.plugin.settings.encryptionKey = '';
+                    }
                     await this.plugin.saveSettings();
+                    // Refresh the settings display
+                    this.display();
                 }));
+
+        // Only show password field if storage is enabled
+        if (this.plugin.settings.storePassword) {
+            new Setting(containerEl)
+                .setName('Encryption Key')
+                .setDesc('Your encryption key will be stored in settings')
+                .addText(text => text
+                    .setPlaceholder('Enter encryption key')
+                    .setValue(this.plugin.settings.encryptionKey)
+                    .onChange(async (value) => {
+                        this.plugin.settings.encryptionKey = value;
+                        await this.plugin.saveSettings();
+                    }));
+        } else {
+            containerEl.createEl('p', { 
+                text: 'Password storage is disabled. You will need to enter the password each time you want to encrypt or decrypt notes.' 
+            });
+        }
+
+        // Add security notice
+        containerEl.createEl('h3', { text: 'Security Notice' });
+        const ul = containerEl.createEl('ul');
+        ul.createEl('li', { 
+            text: 'Storing passwords in settings makes them accessible to other plugins and stored in plain text' 
+        });
+        ul.createEl('li', { 
+            text: 'For maximum security, keep password storage disabled and enter the password each time' 
+        });
     }
 }
