@@ -35,6 +35,34 @@ export default class DailyCipher extends Plugin {
             }
         });
 
+        // Command to encrypt current file
+        this.addCommand({
+            id: 'encrypt-current-file',
+            name: 'Encrypt current file',
+            editorCallback: async (editor: Editor, view: MarkdownView) => {
+                const file = view.file;
+                if (!file) {
+                    new Notice('No file is currently open');
+                    return;
+                }
+                new CryptoModal(this.app, this, file).open();
+            }
+        });
+
+        // Command to decrypt current file
+        this.addCommand({
+            id: 'decrypt-current-file',
+            name: 'Decrypt current file',
+            editorCallback: async (editor: Editor, view: MarkdownView) => {
+                const file = view.file;
+                if (!file) {
+                    new Notice('No file is currently open');
+                    return;
+                }
+                new CryptoModal(this.app, this, file).open();
+            }
+        });
+
         // Editor command (unchanged)
         this.addCommand({
             id: 'sample-editor-command',
@@ -89,10 +117,12 @@ export default class DailyCipher extends Plugin {
 class CryptoModal extends Modal {
     plugin: DailyCipher;
     private password: string = '';
+    private targetFile: TFile | null;
 
-    constructor(app: App, plugin: DailyCipher) {
+    constructor(app: App, plugin: DailyCipher, targetFile: TFile | null = null) {
         super(app);
         this.plugin = plugin;
+        this.targetFile = targetFile;
     }
 
     onOpen() {
@@ -115,10 +145,55 @@ class CryptoModal extends Modal {
                     }
                 }));
 
-        // Encrypt button
+        // Get current file if one is open
+        const activeView = this.app.workspace.getActiveViewOfType(MarkdownView);
+        const currentFile = activeView?.file;
+
+        // Add section for current file operations if a file is open
+        if (currentFile) {
+            contentEl.createEl('h3', { text: 'Current File Operations' });
+            new Setting(contentEl)
+                .setName('Current File')
+                .setDesc(`File: ${currentFile.path}`)
+                .addButton(button => button
+                    .setButtonText('Encrypt Current File')
+                    .setCta()
+                    .onClick(async () => {
+                        try {
+                            if (!this.password) {
+                                new Notice('Please enter a password');
+                                return;
+                            }
+                            await this.encryptSingleFile(currentFile, this.password);
+                            new Notice('Current file encrypted successfully!');
+                        } catch (e) {
+                            new Notice(`Encryption failed: ${e.message}`);
+                        }
+                    }))
+                .addButton(button => button
+                    .setButtonText('Decrypt Current File')
+                    .setCta()
+                    .onClick(async () => {
+                        try {
+                            if (!this.password) {
+                                new Notice('Please enter a password');
+                                return;
+                            }
+                            await this.decryptSingleFile(currentFile, this.password);
+                            new Notice('Current file decrypted successfully!');
+                        } catch (e) {
+                            new Notice(`Decryption failed: ${e.message}`);
+                        }
+                    }));
+        }
+
+        // Add section for all files operations
+        contentEl.createEl('h3', { text: 'All Files Operations' });
         new Setting(contentEl)
+            .setName('Daily Notes Folder')
+            .setDesc('Encrypt or decrypt all files in the Daily folder')
             .addButton(button => button
-                .setButtonText('Encrypt Daily Notes')
+                .setButtonText('Encrypt All Files')
                 .setCta()
                 .onClick(async () => {
                     try {
@@ -127,13 +202,13 @@ class CryptoModal extends Modal {
                             return;
                         }
                         await this.encryptFiles(this.password);
-                        new Notice('Encryption completed successfully!');
+                        new Notice('All files encrypted successfully!');
                     } catch (e) {
                         new Notice(`Encryption failed: ${e.message}`);
                     }
                 }))
             .addButton(button => button
-                .setButtonText('Decrypt Daily Notes')
+                .setButtonText('Decrypt All Files')
                 .setCta()
                 .onClick(async () => {
                     try {
@@ -142,7 +217,7 @@ class CryptoModal extends Modal {
                             return;
                         }
                         await this.decryptFiles(this.password);
-                        new Notice('Decryption completed successfully!');
+                        new Notice('All files decrypted successfully!');
                     } catch (e) {
                         new Notice(`Decryption failed: ${e.message}`);
                     }
@@ -235,15 +310,15 @@ class CryptoModal extends Modal {
                 }
                 const content = await this.app.vault.read(file);
                 
-                // Skip if already encrypted
-                if (this.isEncrypted(content)) {
+                // Separate frontmatter and content first
+                const { frontMatter, mainContent } = this.separateFrontMatter(content);
+                
+                // Skip if main content is already encrypted
+                if (this.isEncrypted(mainContent)) {
                     new Notice(`Skipped ${file.path}: already encrypted`);
                     continue;
                 }
 
-                // Separate frontmatter and content
-                const { frontMatter, mainContent } = this.separateFrontMatter(content);
-                
                 // Only encrypt the main content
                 const encryptedData = await this.encryptContent(mainContent, password);
                 const encodedData = this.encodeEncryptedData(encryptedData);
@@ -260,7 +335,7 @@ class CryptoModal extends Modal {
         }
 
         if (encryptedCount === 0) {
-            new Notice('No files were encrypted: all files were media or failed.');
+            new Notice('No files were encrypted: all files were media, already encrypted, or failed.');
         }
     }
 
@@ -373,6 +448,46 @@ class CryptoModal extends Modal {
         } catch (e) {
             throw new Error('Invalid encrypted data format');
         }
+    }
+
+    // Add new method for encrypting a single file
+    async encryptSingleFile(file: TFile, password: string) {
+        if (this.isMedia(file)) {
+            throw new Error('Cannot encrypt media files');
+        }
+
+        const content = await this.app.vault.read(file);
+        const { frontMatter, mainContent } = this.separateFrontMatter(content);
+        
+        if (this.isEncrypted(mainContent)) {
+            throw new Error('File is already encrypted');
+        }
+
+        const encryptedData = await this.encryptContent(mainContent, password);
+        const encodedData = this.encodeEncryptedData(encryptedData);
+        const finalContent = this.combineFrontMatterAndContent(frontMatter, encodedData);
+        
+        await this.app.vault.modify(file, finalContent);
+    }
+
+    // Add new method for decrypting a single file
+    async decryptSingleFile(file: TFile, password: string) {
+        if (this.isMedia(file)) {
+            throw new Error('Cannot decrypt media files');
+        }
+
+        const content = await this.app.vault.read(file);
+        const { frontMatter, mainContent } = this.separateFrontMatter(content);
+        
+        if (!this.isEncrypted(mainContent)) {
+            throw new Error('File is not encrypted');
+        }
+
+        const encryptedData = this.decodeEncryptedData(mainContent);
+        const decryptedContent = await this.decryptContent(encryptedData, password);
+        const finalContent = this.combineFrontMatterAndContent(frontMatter, decryptedContent);
+        
+        await this.app.vault.modify(file, finalContent);
     }
 
     onClose() {
